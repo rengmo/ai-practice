@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>最简对话 demo · SSE 流式 + token / 费用统计</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; font-family: system-ui, -apple-system, "PingFang SC", sans-serif;
+      background: #f4f5f7; color: #1f2329; height: 100vh; display: flex;
+    }
+    .chat { flex: 1; display: flex; flex-direction: column; max-width: 720px; margin: 0 auto; }
+    header { padding: 14px 18px; background: #fff; border-bottom: 1px solid #e5e6eb; font-weight: 600; }
+    header small { font-weight: 400; color: #86909c; margin-left: 8px; }
+    #log { flex: 1; overflow-y: auto; padding: 18px; display: flex; flex-direction: column; gap: 12px; }
+    .msg { max-width: 78%; padding: 10px 14px; border-radius: 12px; line-height: 1.5; }
+    .user { align-self: flex-end; background: #1677ff; color: #fff; border-bottom-right-radius: 2px; white-space: pre-wrap; }
+    .ai   { align-self: flex-start; background: #fff; border: 1px solid #e5e6eb; border-bottom-left-radius: 2px; }
+    /* AI 气泡内的 Markdown 排版 */
+    .ai.md > :first-child { margin-top: 0; }
+    .ai.md > :last-child  { margin-bottom: 0; }
+    .ai.md p  { margin: 0.5em 0; }
+    .ai.md h1, .ai.md h2, .ai.md h3, .ai.md h4 { margin: 0.8em 0 0.4em; font-size: 1em; font-weight: 600; }
+    .ai.md h1 { font-size: 1.15em; }
+    .ai.md h2 { font-size: 1.08em; }
+    .ai.md ul, .ai.md ol { margin: 0.4em 0; padding-left: 1.4em; }
+    .ai.md li { margin: 0.2em 0; }
+    .ai.md blockquote { margin: 0.5em 0; padding: 0.2em 0.8em; border-left: 3px solid #d0d3d9; color: #4e5969; }
+    .ai.md code { padding: 0.1em 0.35em; border-radius: 4px; background: #f2f3f5; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.92em; }
+    .ai.md pre  { margin: 0.5em 0; padding: 10px 12px; border-radius: 8px; background: #f7f8fa; overflow-x: auto; }
+    .ai.md pre code { padding: 0; background: none; font-size: 0.88em; }
+    .ai.md table { border-collapse: collapse; margin: 0.5em 0; font-size: 0.92em; }
+    .ai.md th, .ai.md td { border: 1px solid #e5e6eb; padding: 4px 8px; }
+    .ai.md th { background: #f7f8fa; }
+    .ai.md a { color: #1677ff; text-decoration: none; }
+    .ai.md a:hover { text-decoration: underline; }
+    .ai.md hr { border: none; border-top: 1px solid #e5e6eb; margin: 0.6em 0; }
+    .round-stat { align-self: flex-start; font-size: 12px; color: #86909c; padding: 0 4px; }
+    .composer { display: flex; gap: 8px; padding: 12px 12px 40px 12px; background: #fff; border-top: 1px solid #e5e6eb; }
+    .composer input { flex: 1; padding: 10px 12px; border: 1px solid #d0d3d9; border-radius: 8px; font-size: 14px; }
+    .composer button { padding: 10px 18px; border: none; border-radius: 8px; background: #1677ff; color: #fff; font-size: 14px; cursor: pointer; }
+    .composer button:disabled { background: #a0c4ff; cursor: not-allowed; }
+    .total { padding: 8px 18px; background: #fffbe6; border-top: 1px solid #ffe58f; font-size: 12px; color: #614700; }
+  </style>
+</head>
+<body>
+  <div class="chat">
+    <header>最简对话 demo <small>纯 HTML/JS · SSE 流式 · Markdown 渲染 · token / 费用统计</small></header>
+    <div id="log"></div>
+    <div class="total" id="total">本会话累计：输入 0 token · 输出 0 token · 合计 0 token · 费用 ¥0.000000</div>
+    <div class="composer">
+      <input id="input" placeholder="说点什么，回车发送…" autocomplete="off" />
+      <button id="send">发送</button>
+    </div>
+  </div>
+
+  <!-- Markdown 渲染：marked 解析 + DOMPurify 消毒，防止 XSS -->
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
+  <script>
+    // 刷新页面也不丢上下文：对话历史与累计 token 都存进 localStorage
+    const STORAGE_KEY = "chat_sse_state_v1";
+    const DEFAULT_MESSAGES = [{ role: "system", content: "你是一个专业的美食助手。" }];
+
+    // DeepSeek 价目表（元 / 百万 token），与 LLM.md 2.1 节一致
+    const PRICING = {
+      "deepseek-v4-pro":   { hit: 0.025, miss: 3, output: 6 },
+      "deepseek-v4-flash": { hit: 0.02,  miss: 1, output: 2 },
+    };
+    const DEFAULT_MODEL = "deepseek-v4-pro";
+
+    const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || "null");
+
+    // 多轮对话历史：每次都把完整历史发给后端（这也是「缓存命中」的前提——前缀不变）
+    const messages = saved?.messages ?? structuredClone(DEFAULT_MESSAGES);
+    const log = document.getElementById("log");
+    const input = document.getElementById("input");
+    const sendBtn = document.getElementById("send");
+    const totalEl = document.getElementById("total");
+
+    // 累计 token 与费用（整个会话）
+    let totalIn = saved?.totalIn ?? 0;
+    let totalOut = saved?.totalOut ?? 0;
+    let totalCostYuan = saved?.totalCostYuan ?? 0;
+
+    // 把当前状态写回 localStorage
+    function persist() {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ messages, totalIn, totalOut, totalCostYuan }));
+    }
+
+    // 按模型名匹配价目表；未知模型退回 pro 价
+    function pricingFor(model) {
+      if (!model) return PRICING[DEFAULT_MODEL];
+      if (PRICING[model]) return PRICING[model];
+      if (model.includes("flash")) return PRICING["deepseek-v4-flash"];
+      return PRICING[DEFAULT_MODEL];
+    }
+
+    // 本次费用 ≈ 命中输入×命中单价 + 未命中输入×未命中单价 + 输出×输出单价（单价单位：元/百万 token）
+    function calcCostYuan(usage) {
+      const price = pricingFor(usage.model);
+      let hit = usage.cache_hit_tokens ?? 0;
+      let miss = usage.cache_miss_tokens ?? 0;
+      if (hit === 0 && miss === 0) miss = usage.prompt_tokens ?? 0; // 无缓存字段时，输入全按未命中计
+      const out = usage.completion_tokens ?? 0;
+      return (hit * price.hit + miss * price.miss + out * price.output) / 1_000_000;
+    }
+
+    function formatRMB(yuan) {
+      if (yuan >= 0.01) return `¥${yuan.toFixed(4)}`;
+      return `¥${yuan.toFixed(6)}`;
+    }
+
+    // 把 Markdown 转成安全的 HTML（AI 回复用）
+    marked.setOptions({ breaks: true, gfm: true });
+    function renderMarkdown(text) {
+      const html = marked.parse(text || "");
+      return DOMPurify.sanitize(html);
+    }
+
+    function addBubble(cls, text, { markdown = false } = {}) {
+      const el = document.createElement("div");
+      el.className = "msg " + cls;
+      if (markdown) {
+        el.classList.add("md");
+        el.innerHTML = renderMarkdown(text);
+      } else {
+        el.textContent = text;
+      }
+      log.appendChild(el);
+      log.scrollTop = log.scrollHeight;
+      return el;
+    }
+
+    // 更新 AI 气泡内容（流式过程中反复调用）
+    function setAiMarkdown(el, text) {
+      el.innerHTML = renderMarkdown(text);
+      log.scrollTop = log.scrollHeight;
+    }
+
+    function renderTotal() {
+      totalEl.textContent =
+        `本会话累计：输入 ${totalIn} token · 输出 ${totalOut} token · 合计 ${totalIn + totalOut} token · 费用 ${formatRMB(totalCostYuan)}`;
+    }
+
+    function showRoundStat(usage) {
+      const hit = usage.cache_hit_tokens, miss = usage.cache_miss_tokens;
+      const roundCost = calcCostYuan(usage);
+      let cache = "";
+      if (hit != null || miss != null) cache = ` · 缓存命中 ${hit ?? 0} / 未命中 ${miss ?? 0}`;
+      const el = document.createElement("div");
+      el.className = "round-stat";
+      el.textContent =
+        `本轮：输入 ${usage.prompt_tokens} · 输出 ${usage.completion_tokens} · 合计 ${usage.total_tokens} token${cache} · 费用 ${formatRMB(roundCost)}`;
+      log.appendChild(el);
+      log.scrollTop = log.scrollHeight;
+
+      totalIn += usage.prompt_tokens;
+      totalOut += usage.completion_tokens;
+      totalCostYuan += roundCost;
+      renderTotal();
+      persist();
+    }
+
+    // 页面加载时：把存档里的历史对话重新画成气泡，恢复累计 token 与费用
+    function restore() {
+      for (const m of messages) {
+        if (m.role === "user") addBubble("user", m.content);
+        else if (m.role === "assistant") addBubble("ai", m.content, { markdown: true });
+      }
+      renderTotal();
+    }
+
+    async function send() {
+      const text = input.value.trim();
+      if (!text) return;
+      input.value = "";
+      sendBtn.disabled = true;
+
+      addBubble("user", text);
+      messages.push({ role: "user", content: text });
+      persist();
+
+      const aiEl = addBubble("ai", "...", { markdown: true });   // 先放一个空气泡，等会儿往里逐块填
+      let answer = "";
+
+      // ① 发起一个普通的 POST 请求；服务器不会马上关连接，而是持续往回推
+      const resp = await fetch("/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ messages }),
+      });
+
+      // ② 读取「流」：SSE 的报文格式是一条条  data: {...}\n\n
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+
+        // 按空行（\n\n）切分出一条条完整 SSE 消息（每条可能含 id: / data: 等多行）
+        let sep;
+        while ((sep = buf.indexOf("\n\n")) >= 0) {
+          const block = buf.slice(0, sep).trim();
+          buf = buf.slice(sep + 2);
+          let dataLine = "";
+          for (const line of block.split("\n")) {
+            if (line.startsWith("data:")) dataLine = line.slice(5).trim();
+          }
+          if (!dataLine) continue;
+          const evt = JSON.parse(dataLine);
+
+          if (evt.type === "delta") {
+            answer += evt.content;
+            setAiMarkdown(aiEl, answer);      // 逐块拼接并实时渲染 Markdown
+          } else if (evt.type === "usage") {
+            showRoundStat(evt.usage);          // 这一轮花了多少 token
+          } else if (evt.type === "error") {
+            aiEl.classList.remove("md");
+            aiEl.textContent = "出错了：" + evt.message;
+          }
+        }
+      }
+
+      messages.push({ role: "assistant", content: answer });  // 存进历史，供下一轮使用
+      persist();
+      sendBtn.disabled = false;
+      input.focus();
+    }
+
+    sendBtn.addEventListener("click", send);
+    input.addEventListener("keydown", (e) => { if (e.key === "Enter") send(); });
+
+    restore();   // 先把上次的对话恢复出来，再聚焦输入框
+    input.focus();
+  </script>
+</body>
+</html>
