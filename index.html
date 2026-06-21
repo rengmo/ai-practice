@@ -37,6 +37,9 @@
     .ai.md a:hover { text-decoration: underline; }
     .ai.md hr { border: none; border-top: 1px solid #e5e6eb; margin: 0.6em 0; }
     .round-stat { align-self: flex-start; font-size: 12px; color: #86909c; padding: 0 4px; }
+    .tool-stat { align-self: flex-start; font-size: 12px; color: #4e5969; padding: 4px 10px; background: #f2f3f5; border-radius: 8px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .file-card { align-self: flex-start; padding: 10px 14px; background: #e8f3ff; border: 1px solid #91caff; border-radius: 10px; font-size: 14px; }
+    .file-card a { color: #0958d9; font-weight: 600; }
     .composer { display: flex; gap: 8px; padding: 12px 12px 40px 12px; background: #fff; border-top: 1px solid #e5e6eb; }
     .composer input { flex: 1; padding: 10px 12px; border: 1px solid #d0d3d9; border-radius: 8px; font-size: 14px; }
     .composer button { padding: 10px 18px; border: none; border-radius: 8px; background: #1677ff; color: #fff; font-size: 14px; cursor: pointer; }
@@ -46,7 +49,7 @@
 </head>
 <body>
   <div class="chat">
-    <header>最简对话 demo <small>纯 HTML/JS · SSE 流式 · Markdown 渲染 · token / 费用统计</small></header>
+    <header>美食助手 <small>SSE · Function Calling · 时令菜谱 PPT · token 统计</small></header>
     <div id="log"></div>
     <div class="total" id="total">本会话累计：输入 0 token · 输出 0 token · 合计 0 token · 费用 ¥0.000000</div>
     <div class="composer">
@@ -60,7 +63,7 @@
   <script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
   <script>
     // 刷新页面也不丢上下文：对话历史与累计 token 都存进 localStorage
-    const STORAGE_KEY = "chat_sse_state_v1";
+    const STORAGE_KEY = "chat_sse_state_v2";
     const DEFAULT_MESSAGES = [{ role: "system", content: "你是一个专业的美食助手。" }];
 
     // DeepSeek 价目表（元 / 百万 token），与 LLM.md 2.1 节一致
@@ -144,6 +147,62 @@
         `本会话累计：输入 ${totalIn} token · 输出 ${totalOut} token · 合计 ${totalIn + totalOut} token · 费用 ${formatRMB(totalCostYuan)}`;
     }
 
+    function showToolStatus(text) {
+      const el = document.createElement("div");
+      el.className = "tool-stat";
+      el.textContent = text;
+      log.appendChild(el);
+      log.scrollTop = log.scrollHeight;
+    }
+
+    async function downloadPPT(url, filename) {
+      const parts = url.split("/");
+      const downloadURL = parts.map((seg, i) => (i < 2 || seg === "") ? seg : encodeURIComponent(seg)).join("/");
+      const resp = await fetch(downloadURL);
+      if (!resp.ok) throw new Error("下载失败 " + resp.status);
+      const blob = await resp.blob();
+      const objURL = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = objURL;
+      a.download = filename;
+      a.click();
+      URL.revokeObjectURL(objURL);
+    }
+
+    function showFileCard(url, filename) {
+      const el = document.createElement("div");
+      el.className = "file-card";
+      el.append("📎 PPT 已生成：");
+      const link = document.createElement("a");
+      link.href = "#";
+      link.textContent = filename;
+      link.addEventListener("click", async (e) => {
+        e.preventDefault();
+        try {
+          await downloadPPT(url, filename);
+        } catch (err) {
+          alert("下载失败：" + err.message);
+        }
+      });
+      el.appendChild(link);
+      log.appendChild(el);
+      log.scrollTop = log.scrollHeight;
+    }
+
+    // AI 回复 Markdown 里的 /downloads/ 链接也走同一套下载逻辑
+    log.addEventListener("click", async (e) => {
+      const a = e.target.closest(".ai.md a[href^='/downloads/']");
+      if (!a) return;
+      e.preventDefault();
+      const url = a.getAttribute("href");
+      const filename = decodeURIComponent(url.split("/").pop() || "download.pptx");
+      try {
+        await downloadPPT(url, filename);
+      } catch (err) {
+        alert("下载失败：" + err.message);
+      }
+    });
+
     function showRoundStat(usage) {
       const hit = usage.cache_hit_tokens, miss = usage.cache_miss_tokens;
       const roundCost = calcCostYuan(usage);
@@ -215,9 +274,18 @@
 
           if (evt.type === "delta") {
             answer += evt.content;
-            setAiMarkdown(aiEl, answer);      // 逐块拼接并实时渲染 Markdown
+            setAiMarkdown(aiEl, answer);
+          } else if (evt.type === "tool_start") {
+            showToolStatus(`⚙️ 调用工具 ${evt.name}…`);
+          } else if (evt.type === "tool_done") {
+            showToolStatus(`✓ ${evt.name} → ${evt.result}`);
+          } else if (evt.type === "file") {
+            showFileCard(evt.url, evt.filename);
           } else if (evt.type === "usage") {
-            showRoundStat(evt.usage);          // 这一轮花了多少 token
+            showRoundStat(evt.usage);
+          } else if (evt.type === "done" && evt.messages) {
+            messages.length = 0;
+            messages.push(...evt.messages);
           } else if (evt.type === "error") {
             aiEl.classList.remove("md");
             aiEl.textContent = "出错了：" + evt.message;
@@ -225,7 +293,13 @@
         }
       }
 
-      messages.push({ role: "assistant", content: answer });  // 存进历史，供下一轮使用
+      if (!answer && messages.length > 0) {
+        const last = messages[messages.length - 1];
+        if (last.role === "assistant") answer = last.content;
+      }
+      if (answer && (messages.length === 0 || messages[messages.length - 1]?.role !== "assistant")) {
+        messages.push({ role: "assistant", content: answer });
+      }
       persist();
       sendBtn.disabled = false;
       input.focus();
